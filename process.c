@@ -639,8 +639,8 @@ void free_G_buffers(__G)     /* releases all memory allocated in global vars */
 
     /* Free the cover span list and the cover structure. */
     if (G.cover != NULL) {
-        free(*(G.cover));
-        free(G.cover);
+        if (0) cover_debug_print_stats(stderr, G.cover);  /* for debugging */
+        cover_free(G.cover);
         G.cover = NULL;
     }
 

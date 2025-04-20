@@ -3134,4 +3134,48 @@ char    *GetLoadPath     OF((__GPRO));                              /* local */
 #endif /* UNICODE_SUPPORT && UNICODE_WCHAR */
 
 
+/* Span cover data structure declarations.
+ *
+ * Conceptually, the data structure maintains a set of ranges [beg, end) where
+ * the left endpoint is inclusive and the right endpoint is exclusive. The
+ * ranges may touch (in which case they can be merged) but never overlap.
+ *
+ * This is used in extract_or_test_files() (extract.c) to detect possible zip
+ * bombs. The declarations are here so the data structure can be freed in
+ * free_G_buffers() (process.c).
+ *
+ * See extract.c for definitions and implementation details.
+ */
+
+typedef struct cover cover_t;
+
+/* Allocates a new cover data structure. Returns NULL if out of memory. */
+cover_t *cover_alloc OF(());
+
+/* Frees a cover data structure. If the argument is NULL nothing happens. */
+void cover_free OF((cover_t *));
+
+/* Checks if any span added to the cover overlaps with the new span [beg...end).
+ *
+ * If `add` is 0, this only queries for overlap.
+ * If `add` is 1, this also adds the span to the cover.
+ *
+ * Returns 0 if the span does not overlap.
+ * Returns -1 if the span overlapped.
+ * Returns -2 if the span does not overlap, but we ran out of memory adding it.
+ */
+int cover_update OF((cover_t *cover, zoff_t beg, zoff_t end, int add));
+
+/* Tests if a span overlaps and returns 0 if not, or -1 if it does. */
+#define cover_test(cover, beg, end) cover_update(cover, beg, end, 0)
+
+/* Adds a span and returns 0 if OK, -1 on overlap, or -2 on out of memory. */
+#define cover_add(cover, beg, end) cover_update(cover, beg, end, 1)
+
+/* Debug prints some internal statistics; useful for debugging. */
+void cover_debug_print_stats OF((FILE *fp, cover_t *cover));
+
+/* end of span cover data structure declarations */
+
+
 #endif /* !__unzpriv_h */

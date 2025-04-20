@@ -325,126 +325,285 @@ static ZCONST char Far OverlappedComponents[] =
   "error: invalid zip file with overlapped components (possible zip bomb)\n";
 
 
-
-
-
-/* A growable list of spans. */
-typedef zusz_t bound_t;
-typedef struct {
-    bound_t beg;        /* start of the span */
-    bound_t end;        /* one past the end of the span */
-} span_t;
-typedef struct {
-    span_t *span;       /* allocated, distinct, and sorted list of spans */
-    size_t num;         /* number of spans in the list */
-    size_t max;         /* allocated number of spans (num <= max) */
-} cover_t;
-
-static size_t cover_find OF((cover_t *, bound_t));
-static int cover_within OF((cover_t *, bound_t));
-static int cover_add OF((cover_t *, bound_t, bound_t));
-
 /*
- * Return the index of the first span in cover whose beg is greater than val.
- * If there is no such span, then cover->num is returned.
- */
-static size_t cover_find(cover, val)
-    cover_t *cover;
-    bound_t val;
-{
-    size_t lo = 0, hi = cover->num;
-    while (lo < hi) {
-        size_t mid = (lo + hi) >> 1;
-        if (val < cover->span[mid].beg)
-            hi = mid;
-        else
-            lo = mid + 1;
-    }
-    return hi;
-}
-
-/* Return true if val lies within any one of the spans in cover. */
-static int cover_within(cover, val)
-    cover_t *cover;
-    bound_t val;
-{
-    size_t pos = cover_find(cover, val);
-    return pos > 0 && val < cover->span[pos - 1].end;
-}
-
-/*
- * Add a new span to the list, but only if the new span does not overlap any
- * spans already in the list. The new span covers the values beg..end-1. beg
- * must be less than end.
+ * Implementation of the range cover data structure.
  *
- * Keep the list sorted and merge adjacent spans. Grow the allocated space for
- * the list as needed. On success, 0 is returned. If the new span overlaps any
- * existing spans, then 1 is returned and the new span is not added to the
- * list. If the new span is invalid because beg is greater than or equal to
- * end, then -1 is returned. If the list needs to be grown but the memory
- * allocation fails, then -2 is returned.
+ * The data structure consists of a list of spans which is maintained in sorted
+ * order, so we can quickly find overlapping spans using binary search. When a
+ * new span is added, it is merged with surrounding spans whenever possible, to
+ * keep the list small in the common case where a zip file's entries appear in
+ * order with no padding in between.
+ *
+ * However, in the less common case where spans cannot be merged, the list
+ * necessarily grows in size, and inserting elements becomes more expensive.
+ * Since inserting into a sorted list takes O(n) time, in the worst case,
+ * n insertions would take O(n^2) time in total.
+ *
+ * To avoid this quadratic runtime, we limit the main list to a relatively
+ * small size (COVER_MIN_SPANS). When that limit is reached, we copy the sorted
+ * spans into a separate span buffer (see span_buf_t below). The additional span
+ * buffers are kept in a linked list. Now, to check for overlap we need to
+ * search not just the main list, but all of the additional span buffers, too.
+ *
+ * This makes insertion fast, but now lookup time grows linearly with the
+ * number of span buffers created. To fix this, we merge span buffers
+ * periodically, using the following invariant: each buffer in the list (except
+ * the first) must be at least twice as large as the one before it.
+ *
+ * This invariant can only be invalidated when we add a new span buffer at the
+ * front of the list, and we can restore it by repeatedly merging the first
+ * two buffers together.
+ *
+ * This implies the following two properties, after n insertions:
+ *
+ *  1. Time spent on merging is O(n) total, or O(1) amortized per insertion.
+ *
+ *  2. There are at most (log n)/(log 2) span buffers, which allows for lookups
+ *     in O(log^2 n) time (log n for each binary search times log n buckets).
+ *
+ * Note that this is slightly worse time complexity than if we used a balanced
+ * binary search tree, which performs insertions and queries in O(log n) time,
+ * but the implementation here has two advantages:
+ *
+ *  1. The logic is relatively simple.
+ *  2. The memory representation is extremely compact, storing arrays of ranges
+ *     with very little overhead. By comparison, binary search trees typically
+ *     add at least two pointers per element, which would double the size of
+ *     the data structure.
  */
-static int cover_add(cover, beg, end)
-    cover_t *cover;
-    bound_t beg;
-    bound_t end;
+
+/* span_t represents a span from `beg` (inclusive) to `end` (exclusive). */
+typedef struct {
+    zoff_t beg;
+    zoff_t end;
+} span_t;
+
+/* span_buf_t is a dynamically allocated array of spans, with a `next` pointer
+   so bufs can be connected in a linked list. */
+typedef struct span_buf {
+    struct span_buf *next;
+    zusz_t len;
+    span_t *spans;
+} span_buf_t;
+
+/* Maximum size of the main span list, before a span buffer is created. */
+#define COVER_MIN_SPANS 16
+
+/* The main cover data structure. */
+struct cover {
+    zusz_t len;
+    span_t spans[COVER_MIN_SPANS];
+    span_buf_t *bufs;
+};
+
+/* Allocates a new span buffer with given capacity. */
+static span_buf_t *alloc_span_buf(cap)
+    zusz_t cap;
 {
-    size_t pos;
-    int prec, foll;
+    span_t *spans;
+    span_buf_t *res;
 
-    if (beg >= end)
-    /* The new span is invalid. */
-        return -1;
+    /* Guard against overflow due to multiplication below: */
+    if ((zusz_t) -1 / sizeof(span_t) < cap) return NULL;
 
-    /* Find where the new span should go, and make sure that it does not
-       overlap with any existing spans. */
-    pos = cover_find(cover, beg);
-    if ((pos > 0 && beg < cover->span[pos - 1].end) ||
-        (pos < cover->num && end > cover->span[pos].beg))
-        return 1;
+    /* Try to allocate the span data first, because it's largest */
+    spans = malloc(sizeof(span_t) * cap);
+    if (spans == NULL) return NULL;  /* out of memory */
 
-    /* Check for adjacencies. */
-    prec = pos > 0 && beg == cover->span[pos - 1].end;
-    foll = pos < cover->num && end == cover->span[pos].beg;
-    if (prec && foll) {
-        /* The new span connects the preceding and following spans. Merge the
-           following span into the preceding span, and delete the following
-           span. */
-        cover->span[pos - 1].end = cover->span[pos].end;
-        cover->num--;
-        memmove(cover->span + pos, cover->span + pos + 1,
-                (cover->num - pos) * sizeof(span_t));
+    /* Next, allocate the surrounding struct. */
+    res = malloc(sizeof(span_buf_t));
+    if (res == NULL) {  /* out of memory */
+        free(spans);
+        return NULL;
     }
-    else if (prec)
-        /* The new span is adjacent only to the preceding span. Extend the end
-           of the preceding span. */
-        cover->span[pos - 1].end = end;
-    else if (foll)
-        /* The new span is adjacent only to the following span. Extend the
-           beginning of the following span. */
-        cover->span[pos].beg = beg;
-    else {
-        /* The new span has gaps between both the preceding and the following
-           spans. Assure that there is room and insert the span.  */
-        if (cover->num == cover->max) {
-            size_t max = cover->max == 0 ? 16 : cover->max << 1;
-            span_t *span = realloc(cover->span, max * sizeof(span_t));
-            if (span == NULL)
-                return -2;
-            cover->span = span;
-            cover->max = max;
+    res->next = NULL;
+    res->len = 0;
+    res->spans = spans;
+    return res;
+}
+
+static void free_span_buf(buf)
+    span_buf_t *buf;
+{
+    if (buf != NULL) {
+        free(buf->spans);
+        free(buf);
+    }
+}
+
+/* Given a sorted array of spans, uses binary search to find the index of the
+   first span where beg >= pos, or returns `len` if no such span exists. */
+static zusz_t span_bin_search(array, len, pos)
+    span_t *array;
+    zusz_t len;
+    zoff_t pos;
+{
+    zusz_t lo = 0, hi = len, mid;
+
+    while (lo < hi) {
+        mid = lo + (hi - lo) / 2;
+        if (array[mid].beg < pos) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
-        memmove(cover->span + pos + 1, cover->span + pos,
-                (cover->num - pos) * sizeof(span_t));
-        cover->num++;
-        cover->span[pos].beg = beg;
-        cover->span[pos].end = end;
+    }
+    return lo;
+}
+
+/* Merges two sorted span arrays into a new span buffer. */
+static span_buf_t *merge_spans(arr1, len1, arr2, len2)
+    span_t *arr1;
+    zusz_t len1;
+    span_t *arr2;
+    zusz_t len2;
+{
+    span_buf_t *buf;
+    zusz_t i, j, k;
+    span_t cur, next;
+
+    buf = alloc_span_buf(len1 + len2);
+    if (buf == NULL) return NULL;  /* out of memory */
+
+    if (len1 + len2 == 0) return buf;  /* empty buf; doesn't happen */
+
+    i = 0;  /* input index into arr1 */
+    j = 0;  /* input index into arr2 */
+    k = 0;  /* output index into buf */
+    cur = i < len1 && (j >= len2 || arr1[i].beg <= arr2[j].beg) ? arr1[i++] : arr2[j++];
+    while (i < len1 || j < len2) {
+        next = i < len1 && (j >= len2 || arr1[i].beg <= arr2[j].beg) ? arr1[i++] : arr2[j++];
+        if (next.beg <= cur.end) {
+            if (next.end > cur.end) cur.end = next.end;
+        } else {
+            buf->spans[k++] = cur;
+            cur = next;
+        }
+    }
+    buf->spans[k++] = cur;
+    buf->len = k;
+    return buf;
+}
+
+cover_t *cover_alloc() {
+    cover_t *cover;
+
+    cover = malloc(sizeof(cover_t));
+    if (cover == NULL) return NULL;  /* out of memory */
+    cover->len = 0;
+    cover->bufs = NULL;
+    return cover;
+}
+
+void cover_free(cover)
+    cover_t *cover;
+{
+    span_buf_t *buf, *next;
+
+    for (buf = cover->bufs; buf; buf = next) {
+        next = buf->next;
+        free_span_buf(buf);
+    }
+    free(cover);
+}
+
+int cover_update(cover, beg, end, add)
+    cover_t *cover;
+    zoff_t beg;
+    zoff_t end;
+    int add;
+{
+    zusz_t i, j;
+    span_buf_t *buf, *first, *second;
+    span_t new_span = { beg, end };
+
+    /* First, check the main span list for overlap. */
+    i = span_bin_search(cover->spans, cover->len, end);
+    if (i > 0 && cover->spans[i - 1].end > beg) return -1;  /* overlap found */
+
+    /* Second, check the backup buffers for overlap. */
+    for (buf = cover->bufs; buf != NULL; buf = buf->next) {
+        j = span_bin_search(buf->spans, buf->len, end);
+        if (j > 0 && buf->spans[j - 1].end > beg) return -1;  /* overlap found */
+    }
+
+    /* No overlap. Great! If we don't need to add the span, we're done. */
+    if (add != 1) return 0;
+
+    /* Check if we can combine the new span with an existing one: */
+    if (i > 0 && cover->spans[i - 1].end == beg &&
+        i < cover->len && cover->spans[i].beg == end) {
+        /* Case 1: new span is adjacent to span on the left and right.
+           merge the two into a single span covering the entire range. */
+        cover->spans[i - 1].end = cover->spans[i].end;
+        for (j = i + 1; j < cover->len; ++j) {
+            cover->spans[j - 1] = cover->spans[j];
+        }
+        --cover->len;
+    } else if (i > 0 && cover->spans[i - 1].end == beg) {
+        /* Case 2: new span is adjacent to the span on the left. Extend it. */
+        cover->spans[i - 1].end = end;
+    } else if (i < cover->len && cover->spans[i].beg == end) {
+        /* Case 3: new span is adjacent to the span on the right. Extend it. */
+        cover->spans[i].beg = beg;
+    } else {
+        /* Case 4: new span is not adjacent to any existing span. Insert it. */
+        if (cover->len < COVER_MIN_SPANS) {
+            /* Insert at index `i` into the main list. */
+            for (j = cover->len; j > i; --j) {
+                cover->spans[j] = cover->spans[j - 1];
+            }
+            cover->spans[i] = new_span;
+            cover->len += 1;
+        } else {
+            /* Main list of spans is full. Move to a span buffer: */
+            buf = alloc_span_buf(cover->len);
+            if (buf == NULL) return -2;  /* out of memory */
+            memcpy(buf->spans, cover->spans, sizeof(span_t) * cover->len);
+            buf->len = cover->len;
+            buf->next = cover->bufs;
+            cover->bufs = buf;
+
+            /* Add new span to now empty main list: */
+            cover->spans[0] = new_span;
+            cover->len = 1;
+
+            /* Merge span buffers, to restore the invariant that each buffer in
+               the list is at most half the size of the next: */
+            first = cover->bufs;
+            second = first->next;
+            while (second != NULL && first->len * 2 >= second->len) {
+                buf = merge_spans(first->spans, first->len, second->spans, second->len);
+                if (buf == NULL) return -2;  /* out of memory */
+                buf->next = second->next;
+                cover->bufs = buf;
+                free_span_buf(first);
+                free_span_buf(second);
+                first = buf;
+                second = first->next;
+            }
+        }
     }
     return 0;
 }
 
+/* Debug print sizes of cover data structure. Note the casts to int may overflow
+ * but that's ok because this output is just for debugging.
+ */
+void cover_debug_print_stats(fp, cover)
+    FILE *fp;
+    cover_t *cover;
+{
+    span_buf_t *buf;
+    zusz_t total = cover->len;
 
-
+    fprintf(fp, "cover main list size: %d\n", (int) total);
+    for (buf = cover->bufs; buf != NULL; buf = buf->next) {
+        fprintf(fp, "cover span buffer size: %d\n", (int) buf->len);
+        total += buf->len;
+    }
+    fprintf(fp, "cover total size: %d\n", (int) total);
+}
 
 
 /**************************************/
@@ -502,17 +661,15 @@ int extract_or_test_files(__G)    /* return PK-type error code */
        the end of central directory record (including the Zip64 end of central
        directory locator, if present), and the Zip64 end of central directory
        record, if present. */
-    if (G.cover == NULL) {
-        G.cover = malloc(sizeof(cover_t));
-        if (G.cover == NULL) {
-            Info(slide, 0x401, ((char *)slide,
-              LoadFarString(NotEnoughMemCover)));
-            return PK_MEM;
-        }
-        ((cover_t *)G.cover)->span = NULL;
-        ((cover_t *)G.cover)->max = 0;
+    if (G.cover != NULL) {
+        cover_free(G.cover);
     }
-    ((cover_t *)G.cover)->num = 0;
+    G.cover = cover_alloc();
+    if (G.cover == NULL) {
+        Info(slide, 0x401, ((char *)slide,
+            LoadFarString(NotEnoughMemCover)));
+        return PK_MEM;
+    }
     if (cover_add((cover_t *)G.cover,
                   G.extra_bytes + G.ecrec.offset_start_central_directory,
                   G.extra_bytes + G.ecrec.offset_start_central_directory +
@@ -523,7 +680,7 @@ int extract_or_test_files(__G)    /* return PK-type error code */
     }
     if ((G.extra_bytes != 0 &&
          cover_add((cover_t *)G.cover,
-                   (bound_t)0, (bound_t)G.extra_bytes) != 0) ||
+                   (zoff_t)0, (zoff_t)G.extra_bytes) != 0) ||
         (G.ecrec.have_ecr64 &&
          cover_add((cover_t *)G.cover, G.ecrec.ec64_start,
                    G.ecrec.ec64_end) != 0) ||
@@ -1222,7 +1379,7 @@ static int extract_or_test_entrylist(__G__ numchunk,
 
         /* seek_zipf(__G__ pInfo->offset);  */
         request = G.pInfo->offset + G.extra_bytes;
-        if (cover_within((cover_t *)G.cover, (bound_t)request)) {
+        if (cover_test((cover_t *)G.cover, (zoff_t)request, (zoff_t)request + 1)) {
             Info(slide, 0x401, ((char *)slide,
               LoadFarString(OverlappedComponents)));
             return PK_BOMB;
